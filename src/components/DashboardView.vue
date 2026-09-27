@@ -10,6 +10,7 @@
       <div class="stat red"><span class="s-ic">📢</span><b>{{ s.negRate }}%</b><em>负面占比</em></div>
       <div class="stat alarm"><span class="s-ic">🔔</span><b>{{ s.alertOpen ?? 0 }}</b><em>未解除预警</em></div>
       <div class="stat crisis"><span class="s-ic">🛟</span><b>{{ s.crisisActive ?? 0 }}</b><em>在办危机</em></div>
+      <div class="stat wo"><span class="s-ic">📋</span><b>{{ s.woOpen ?? 0 }}</b><em>在办工单</em></div>
     </div>
 
     <div class="grid">
@@ -134,7 +135,7 @@ function statusText(st) { return { monitoring: '监测中', disposal: '处置中
 .stat b{font-size:26px;color:#fff;}.stat em{font-size:11px;color:#8ba2c8;font-style:normal;}
 .s-ic{font-size:20px;}
 .stat.pos b{color:#66bb6a;}.stat.neu b{color:#90a4ae;}.stat.neg b{color:#ef5350;}.stat.warn b{color:#ffb300;}.stat.red b{color:#ef5350;}
-.stat.alarm b{color:#ffab91;}.stat.crisis b{color:#90caf9;}
+.stat.alarm b{color:#ffab91;}.stat.crisis b{color:#90caf9;}.stat.wo b{color:#80cbc4;}
 .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;}
 @media(max-width:860px){.grid{grid-template-columns:1fr;}}
 .card{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:16px;}

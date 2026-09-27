@@ -24,7 +24,7 @@
           <div class="t-head">
             <span class="st" :class="t.status">{{ t.statusText }}</span>
             <b class="t-title">{{ t.title }}</b>
-            <span class="kind">{{ t.kind==='alert' ? '🚨 预警' : '🛟 危机' }}</span>
+            <span class="kind">{{ t.kind==='alert' ? '🚨 预警' : t.kind==='workorder' ? '📋 工单' : '🛟 危机' }}</span>
             <span v-if="t.escalated_from" class="esc-tag">⬆ 升级自 #{{ t.escalated_from }}</span>
           </div>
           <div class="t-content">{{ t.content }}</div>

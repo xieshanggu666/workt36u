@@ -133,6 +133,21 @@ export const usePubStore = defineStore('pub', {
       await this.load() // 采集带来新舆情：刷新总览统计与各闭环角标
       return r
     },
-    async fetchCollectRuns(sourceId) { return (await api('/collect/runs', 'GET', null, sourceId ? { source_id: sourceId } : null)).runs }
+    async fetchCollectRuns(sourceId) { return (await api('/collect/runs', 'GET', null, sourceId ? { source_id: sourceId } : null)).runs },
+    // ===== 协同工单：跨角色危机协同 =====
+    async fetchWOOverview(qs) { return await api('/work-orders/overview', 'GET', null, qs || null) },
+    async fetchWO(id) { return await api(`/work-orders/${id}`) },
+    async createWO(w) {
+      const r = await api('/work-orders', 'POST', w)
+      await this.load() // 刷新在办工单角标
+      this.msg('工单已拆分并指派，已联动通知处理人', 'success')
+      return r
+    },
+    // 工单操作（接单/办结/回退/改派/取消）：统一入口，错误 toast 由调用方处理
+    async woOp(id, op, body) {
+      const r = await api(`/work-orders/${id}/${op}`, 'POST', body)
+      await this.load() // 办结/回退会回写危机时间线与预警状态：刷新全局统计
+      return r
+    }
   }
 })

@@ -17,6 +17,11 @@ import {
   startTask, stopTask, runNowTask, resetCursor,
   startCollectScheduler, resumeCollectTasks
 } from './collect.js'
+import {
+  WO_STATUS, WO_PRIORITY, DIRECTORY, listWOs, getWO, listWOLogs,
+  createWO, assignWO, startWO, completeWO, returnWO, cancelWO,
+  startWorkScheduler
+} from './workorder.js'
 
 const app = express()
 app.use(express.json({ limit: '5mb' })) // 大批量导入（上限 5000 条）
@@ -36,11 +41,14 @@ startScheduler()
 const resumedCollect = resumeCollectTasks()
 if (resumedCollect) console.log(`[COLLECT] ${resumedCollect} 个采集任务随启动自动接续（游标续采）`)
 startCollectScheduler()
+// 工单调度：超时未办结的协同工单自动升级（升级链不二次升级）
+startWorkScheduler()
 
-// 危机列表（含来源规则、承接规则、未解除预警数、时间线）
+// 危机列表（含来源规则、承接规则、未解除预警数、在办工单数、时间线）
 function crisisList(withTimeline = false) {
   const list = q(`SELECT c.*, a.title alert_title,
-    (SELECT COUNT(*) FROM alert_events ae WHERE ae.crisis_id=c.id AND ae.status='open') open_events
+    (SELECT COUNT(*) FROM alert_events ae WHERE ae.crisis_id=c.id AND ae.status='open') open_events,
+    (SELECT COUNT(*) FROM work_orders wo WHERE wo.crisis_id=c.id AND wo.status IN ('pending','doing')) wo_open
     FROM crisis c LEFT JOIN alerts a ON a.id=c.alert_id ORDER BY c.id DESC`)
   return list.map((c) => {
     const rules = q(`SELECT ca.alert_id, ca.is_origin, ca.first_at, ca.last_at, al.title alert_title, al.level alert_level
@@ -66,7 +74,8 @@ app.get('/api/state', (req, res) => {
     (SELECT COUNT(*) FROM crisis WHERE status!='closed') crisisActive,
     (SELECT COUNT(*) FROM crisis WHERE status='closed') crisisClosed,
     (SELECT COUNT(*) FROM notify_tasks WHERE status IN ('pending','failed')) notifyOpen,
-    (SELECT COUNT(*) FROM collect_sources WHERE running=1 AND enabled=1) collectRunning`)
+    (SELECT COUNT(*) FROM collect_sources WHERE running=1 AND enabled=1) collectRunning,
+    (SELECT COUNT(*) FROM work_orders WHERE status IN ('pending','doing')) woOpen`)
   // 热度趋势（近7时段）
   const nowH = new Date().getHours()
   const trend = []
@@ -462,6 +471,8 @@ app.delete('/api/crisis/:id', (req, res) => {
   run('UPDATE alert_events SET crisis_id=NULL WHERE crisis_id=?', req.params.id)
   run('DELETE FROM crisis_timeline WHERE crisis_id=?', req.params.id)
   run('DELETE FROM crisis_closures WHERE crisis_id=?', req.params.id)
+  run('DELETE FROM work_order_logs WHERE wo_id IN (SELECT id FROM work_orders WHERE crisis_id=?)', req.params.id)
+  run('DELETE FROM work_orders WHERE crisis_id=?', req.params.id)
   run('DELETE FROM crisis WHERE id=?', req.params.id)
   res.json({ ok: true })
 })
@@ -477,6 +488,96 @@ function guard(need) {
     next()
   }
 }
+
+// ===== 协同工单：从危机拆分跨角色任务 =====
+// 权限：admin/ops 拆分·改派·取消；处理人本人（含观察员）可接单/办结/退回自己的工单；验收回退需 ops 以上
+function woActor(req, wo) {
+  const a = actorOf(req)
+  if (permit(req, 'ops')) return a
+  if (wo && wo.assignee && a.user === wo.assignee) return a // 跨角色协同：被指派即获得该工单操作权
+  return null
+}
+function woDeny(res, req, extra = '') {
+  return res.status(403).json({ error: `权限不足：${extra || '仅工单处理人本人或值班员以上可操作'}（当前：${ROLE_TEXT[actorOf(req).role]}）` })
+}
+
+// 总览：工单列表 + 状态计数 + 处理人名录 + 当前身份（前端据此渲染权限化界面）
+app.get('/api/work-orders/overview', (req, res) => {
+  const { orders, counts } = listWOs({
+    status: String(req.query.status || ''),
+    crisisId: req.query.crisis_id ? +req.query.crisis_id : null,
+    limit: Math.min(200, +req.query.limit || 100)
+  })
+  res.json({
+    orders, counts, directory: DIRECTORY,
+    actor: actorOf(req), roles: ROLE_TEXT,
+    statusText: WO_STATUS, priorityText: WO_PRIORITY
+  })
+})
+app.get('/api/work-orders/:id', (req, res) => {
+  const order = getWO(+req.params.id)
+  if (!order) return res.status(404).json({ error: '工单不存在' })
+  res.json({ order, logs: listWOLogs(order.id) })
+})
+
+// 拆分工单（ops 及以上）：从危机创建并指派，写入危机时间线并联动通知处理人
+app.post('/api/work-orders', guard('ops'), (req, res) => {
+  const r = createWO(req.actor, req.body || {})
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json({ ok: true, order: r.order })
+})
+
+// 改派（ops 及以上）：待处理/处理中可改派，通知新处理人
+app.post('/api/work-orders/:id/assign', guard('ops'), (req, res) => {
+  const r = assignWO(+req.params.id, req.actor, String((req.body && req.body.assignee) || '').trim())
+  if (!r) return res.status(404).json({ error: '工单不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json({ ok: true, already: !!r.already, order: r.order })
+})
+
+// 接单 / 办结：处理人本人或值班员以上
+app.post('/api/work-orders/:id/start', (req, res) => {
+  const wo = getWO(+req.params.id)
+  if (!wo) return res.status(404).json({ error: '工单不存在' })
+  const a = woActor(req, wo)
+  if (!a) return woDeny(res, req)
+  const r = startWO(wo.id, a)
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json({ ok: true, already: !!r.already, order: r.order })
+})
+// 办结：结果回写危机时间线；resolve_alerts=1 时联动解除该危机全部未解除预警（resolve_kind=workorder）
+app.post('/api/work-orders/:id/complete', (req, res) => {
+  const wo = getWO(+req.params.id)
+  if (!wo) return res.status(404).json({ error: '工单不存在' })
+  const a = woActor(req, wo)
+  if (!a) return woDeny(res, req)
+  const r = completeWO(wo.id, a, {
+    result: (req.body && req.body.result) || '',
+    resolveAlerts: !!(req.body && req.body.resolve_alerts)
+  })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json({ ok: true, already: !!r.already, resolved: r.resolved || 0, crisisId: r.crisisId ?? null, order: r.order })
+})
+
+// 回退（双向）：处理中→待处理（处理人/值班员退回，清空处理人）；已完成→处理中（验收回退，需值班员以上）
+app.post('/api/work-orders/:id/return', (req, res) => {
+  const wo = getWO(+req.params.id)
+  if (!wo) return res.status(404).json({ error: '工单不存在' })
+  const review = wo.status === 'done'
+  const a = review ? permit(req, 'ops') : woActor(req, wo)
+  if (!a) return woDeny(res, req, review ? '验收回退需要值班员以上权限' : '')
+  const r = returnWO(wo.id, a, (req.body && req.body.note || '').trim(), { review })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json({ ok: true, already: !!r.already, kind: r.kind, order: r.order })
+})
+
+// 取消（ops 及以上）
+app.post('/api/work-orders/:id/cancel', guard('ops'), (req, res) => {
+  const r = cancelWO(+req.params.id, req.actor, (req.body && req.body.note || '').trim())
+  if (!r) return res.status(404).json({ error: '工单不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json({ ok: true, already: !!r.already, order: r.order })
+})
 
 // 总览：渠道 + 订阅 + 任务计数 + 当前身份（前端据此渲染权限化界面）
 app.get('/api/notify/overview', (req, res) => {

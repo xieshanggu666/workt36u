@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS alert_events (
   time TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'open',  -- open/resolved（预警是否解除）
   resolved TEXT,                -- 解除时间
-  resolve_kind TEXT NOT NULL DEFAULT '' -- 解除途径：manual/batch/close/notify（空=历史数据）
+  resolve_kind TEXT NOT NULL DEFAULT '' -- 解除途径：manual/batch/close/notify/workorder（空=历史数据）
 );
 CREATE TABLE IF NOT EXISTS crisis (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -246,6 +246,36 @@ CREATE TABLE IF NOT EXISTS collect_runs (
   finished TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_collect_runs_source ON collect_runs (source_id, id);
+-- 协同工单：从危机拆分跨角色任务（指派/状态流转/超时升级/回退），结果回写危机时间线与预警状态
+CREATE TABLE IF NOT EXISTS work_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  crisis_id INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  assignee TEXT NOT NULL DEFAULT '',      -- 处理人（用户名录中的姓名；空=待指派）
+  priority TEXT NOT NULL DEFAULT 'mid',   -- high/mid/low
+  status TEXT NOT NULL DEFAULT 'pending', -- pending/doing/done/escalated/cancelled
+  due_at INTEGER,                         -- 截止时间毫秒时间戳（超时自动升级）
+  result TEXT NOT NULL DEFAULT '',        -- 处理结果（办结时回写危机时间线）
+  result_at TEXT,
+  return_count INTEGER NOT NULL DEFAULT 0, -- 回退次数（退回待处理 + 验收回退返工）
+  escalated_from INTEGER,                 -- 升级来源工单（升级链不二次升级）
+  created_by TEXT NOT NULL DEFAULT '',
+  created TEXT NOT NULL,
+  updated TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_work_orders_due ON work_orders (status, due_at);
+CREATE INDEX IF NOT EXISTS idx_work_orders_crisis ON work_orders (crisis_id, status);
+-- 工单留痕：创建/指派/接单/办结/回退/取消/升级全程记录（含操作人）
+CREATE TABLE IF NOT EXISTS work_order_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  wo_id INTEGER NOT NULL,
+  action TEXT NOT NULL,                 -- created/assigned/started/completed/returned/cancelled/escalated
+  detail TEXT NOT NULL DEFAULT '',
+  operator TEXT NOT NULL DEFAULT '系统',
+  time TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_work_order_logs_wo ON work_order_logs (wo_id, id);
 -- 注：posts.idem_key 索引在下方 ensureColumn 之后创建（旧库可能尚无该列，此处创建会导致启动失败）
 `)
 
@@ -497,3 +527,59 @@ function seedCollect() {
   cs.run('论坛爬虫（故障演练）', 'crawler', 'mock://forum/always-fail', 6, '', '', 30, 5, 3, nowStr, '系统初始化')
 }
 seedCollect()
+
+// 协同工单种子（独立幂等：老库升级后同样补齐演示工单与「工单站内信」渠道）
+function seedWorkorders() {
+  // 工单联动通知默认经站内信渠道（不存在则补建；被停用时工单通知自动跳过）
+  db.prepare(`INSERT INTO notify_channels (name,type,target,enabled,created,created_by)
+    SELECT '工单站内信','inapp','inapp://workorder',1,?,'系统初始化'
+    WHERE NOT EXISTS (SELECT 1 FROM notify_channels WHERE name='工单站内信')`)
+    .run(new Date().toLocaleString('zh-CN'))
+  const n = db.prepare('SELECT COUNT(*) c FROM work_orders').get().c
+  if (n > 0) return
+  const crisis = db.prepare("SELECT id, title FROM crisis WHERE status='disposal' ORDER BY id LIMIT 1").get()
+  if (!crisis) return // 无在办危机时不预置（如新库种子结构变更）
+  const nowMs = Date.now()
+  const nowStr = new Date().toLocaleString('zh-CN')
+  const ago = (m) => new Date(nowMs - m * 60000).toLocaleString('zh-CN')
+  const wi = db.prepare(`INSERT INTO work_orders (crisis_id,title,detail,assignee,priority,status,due_at,result,result_at,return_count,escalated_from,created_by,created,updated)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+  const wl = db.prepare('INSERT INTO work_order_logs (wo_id,action,detail,operator,time) VALUES (?,?,?,?,?)')
+  const ct = db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)')
+  const cid = crisis.id
+  // w1 处理中（值班员李澈）；w2 待处理（观察员王观——跨角色协同演示）；w3 已办结（结果已回写时间线）
+  const w1 = Number(wi.run(cid, '发布官方回应声明', '按处置方案 2 小时内完成首次全网回应，声明稿经管理员审核后发布。', '李澈', 'high', 'doing', nowMs + 30 * 60000, '', null, 0, null, '张岚', ago(100), ago(80)).lastInsertRowid)
+  const w2 = Number(wi.run(cid, '涉事门店整改复查', '现场复查涉事门店整改情况，拍照留档并输出复查记录。', '王观', 'mid', 'pending', nowMs + 60 * 60000, '', null, 0, null, '张岚', ago(95), ago(95)).lastInsertRowid)
+  const w3 = Number(wi.run(cid, '舆情热度日报整理', '汇总近 24 小时舆情热度与情感分布，输出日报。', '李澈', 'low', 'done', nowMs - 10 * 60000, '日报已输出并同步处置群，负面热度环比下降 12%。', ago(40), 0, null, '张岚', ago(200), ago(40)).lastInsertRowid)
+  // w4 超时已升级（原单关闭）→ w5 升级单（指派管理员张岚，升级链不二次升级）
+  const w4 = Number(wi.run(cid, '联系权威媒体发布透明报告', '对接权威媒体发布整改透明报告，挽回品牌信任。', '王观', 'mid', 'escalated', nowMs - 20 * 60000, '', null, 0, null, '张岚', ago(150), ago(20)).lastInsertRowid)
+  const w5 = Number(wi.run(cid, '【升级】联系权威媒体发布透明报告', '对接权威媒体发布整改透明报告，挽回品牌信任。', '张岚', 'high', 'pending', nowMs + 30 * 60000, '', null, 0, w4, '系统（超时升级）', ago(20), ago(20)).lastInsertRowid)
+  wl.run(w1, 'created', '从危机拆分工单并指派给 李澈（限期 120 分钟）', '张岚', ago(100))
+  wl.run(w1, 'started', '处理人接单，开始处理', '李澈', ago(80))
+  wl.run(w2, 'created', '从危机拆分工单并指派给 王观（限期 150 分钟）', '张岚', ago(95))
+  wl.run(w3, 'created', '从危机拆分工单并指派给 李澈（限期 180 分钟）', '张岚', ago(200))
+  wl.run(w3, 'started', '处理人接单，开始处理', '李澈', ago(190))
+  wl.run(w3, 'completed', '办结：日报已输出并同步处置群，负面热度环比下降 12%。', '李澈', ago(40))
+  wl.run(w4, 'created', '从危机拆分工单并指派给 王观（限期 130 分钟）', '张岚', ago(150))
+  wl.run(w4, 'escalated', '超时未办结，自动升级至 张岚', '系统', ago(20))
+  wl.run(w5, 'created', `工单 #${w4} 超时升级生成（优先级上调：中→高）`, '系统', ago(20))
+  ct.run(cid, '工单拆分', '拆分工单「发布官方回应声明」→ 处理人 李澈（优先级 高）', ago(100))
+  ct.run(cid, '工单拆分', '拆分工单「涉事门店整改复查」→ 处理人 王观（优先级 中）', ago(95))
+  ct.run(cid, '工单完成', '工单「舆情热度日报整理」由 李澈 办结：日报已输出并同步处置群，负面热度环比下降 12%。', ago(40))
+  ct.run(cid, '工单升级', `工单「联系权威媒体发布透明报告」超时未办结，已升级至 张岚（新工单 #${w5}）`, ago(20))
+  // 升级单联动通知（幂等键去重，由通知调度器统一发送）
+  const ch = db.prepare("SELECT id, name FROM notify_channels WHERE name='工单站内信'").get()
+  if (ch) {
+    const nt = db.prepare(`INSERT OR IGNORE INTO notify_tasks
+      (idem_key,sub_id,channel_id,alert_event_id,crisis_id,kind,title,content,status,attempts,max_attempts,next_retry_at,require_ack,created,updated)
+      VALUES (?,NULL,?,NULL,?,?,?,?,'pending',0,3,NULL,0,?,?)`)
+      .run(`wo:${w5}:escalate:ch${ch.id}`, ch.id, cid, 'workorder',
+        '【工单升级】【升级】联系权威媒体发布透明报告',
+        `工单 #${w4} 超时未办结，已升级至 张岚 处理 · 危机 #${cid}`, nowStr, nowStr)
+    if (Number(nt.changes)) {
+      db.prepare('INSERT INTO notify_logs (task_id,action,detail,operator,time) VALUES (?,?,?,?,?)')
+        .run(Number(nt.lastInsertRowid), 'created', `协同工单升级生成通知任务（渠道：${ch.name}）`, '系统', nowStr)
+    }
+  }
+}
+seedWorkorders()

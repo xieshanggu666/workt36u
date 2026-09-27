@@ -29,6 +29,7 @@
           <b class="ct">{{ c.title }}</b>
           <span class="origin" :class="c.origin">{{ c.origin==='auto' ? '🤖 自动建档' : '✍️ 人工建档' }}</span>
           <span v-if="c.open_events" class="open-badge">🔔 未解除预警 {{ c.open_events }}</span>
+          <span v-if="c.wo_open" class="wo-badge">📋 在办工单 {{ c.wo_open }}</span>
           <span class="st" :class="c.status">{{ stText(c.status) }}</span>
           <button class="del" @click="del(c)">✕</button>
         </div>
@@ -177,7 +178,7 @@ async function reopen(c) {
   await store.reopenCrisis(c.id, note)
   if (reviewId.value === c.id) review.value = await store.fetchCrisisReview(c.id) // 刷新回溯（结案档案/未解除计数）
 }
-function kindText(k) { return { manual: '手动解除', batch: '批量解除', close: '结案联动', notify: '通知回执' }[k] || k }
+function kindText(k) { return { manual: '手动解除', batch: '批量解除', close: '结案联动', notify: '通知回执', workorder: '工单联动' }[k] || k }
 async function del(c) {
   if (confirm(`删除危机「${c.title}」？`)) await store.delCrisis(c.id)
 }
@@ -207,6 +208,7 @@ textarea{resize:vertical;min-height:52px;}
 .origin{font-size:10px;padding:2px 8px;border-radius:6px;background:#0d2137;color:#90caf9;border:1px solid rgba(144,202,249,.25);}
 .origin.manual{background:#1a2332;color:#8ba2c8;border-color:rgba(120,160,220,.2);}
 .open-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#3e2723;color:#ffab91;border:1px solid rgba(255,138,101,.3);}
+.wo-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#0d2137;color:#80cbc4;border:1px solid rgba(128,203,196,.3);}
 .st{font-size:11px;padding:2px 10px;border-radius:6px;}
 .st.monitoring{background:#37474f;color:#b0bec5;}.st.disposal{background:#b71c1c;color:#ffcdd2;}.st.closed{background:#1b5e20;color:#a5d6a7;}
 .del{background:none;border:none;color:#ef5350;font-size:15px;cursor:pointer;}
