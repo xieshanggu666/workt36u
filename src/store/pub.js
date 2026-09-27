@@ -18,6 +18,8 @@ export const usePubStore = defineStore('pub', {
     loaded: false,
     sources: [], hotWords: [], activeAlerts: [], crises: [], stats: {}, trend: [],
     user: { name: '张岚', role: 'admin' }, // 当前身份（admin 管理员 / ops 值班员 / viewer 观察员）
+    tab: 'dash',          // 当前页签（危机卡片可跳转协同工单）
+    woDraftCrisis: null,  // 从危机卡片「拆分工单」带入的预填危机 id
     toast: null
   }),
   actions: {
@@ -133,6 +135,21 @@ export const usePubStore = defineStore('pub', {
       await this.load() // 采集带来新舆情：刷新总览统计与各闭环角标
       return r
     },
-    async fetchCollectRuns(sourceId) { return (await api('/collect/runs', 'GET', null, sourceId ? { source_id: sourceId } : null)).runs }
+    async fetchCollectRuns(sourceId) { return (await api('/collect/runs', 'GET', null, sourceId ? { source_id: sourceId } : null)).runs },
+    // ===== 跨角色危机协同工单 =====
+    async fetchWorkOrders(filter) { return await api('/work-orders', 'GET', null, filter) },
+    async fetchWorkOrder(id) { return await api(`/work-orders/${id}`) },
+    async createWorkOrder(wo) {
+      const r = await api('/work-orders', 'POST', wo)
+      await this.load() // 刷新危机卡片工单统计与角标
+      this.msg(`工单 #${r.id} 已拆分` + (wo.assignee ? `，已分派给 ${wo.assignee}` : '，待分派'), 'success')
+      return r
+    },
+    // 工单操作（认领/指派/开始/阻塞/完成/回退/取消）：统一入口，错误 toast 由调用方处理
+    async workOrderOp(id, op, body) {
+      const r = await api(`/work-orders/${id}/${op}`, 'POST', body || {})
+      await this.load() // 工单回写危机时间线/预警状态：刷新全局统计
+      return r
+    }
   }
 })

@@ -17,6 +17,14 @@ import {
   startTask, stopTask, runNowTask, resetCursor,
   startCollectScheduler, resumeCollectTasks
 } from './collect.js'
+import {
+  WO_STATUS, WO_PRIORITY, WO_ROLE, WO_CATEGORY,
+  listWorkOrders, getWorkOrder, workOrderLogs, workOrderSummary, crisisOpenCount,
+  createWorkOrder, assignWorkOrder, claimWorkOrder, startWorkOrder,
+  blockWorkOrder, completeWorkOrder, reworkWorkOrder, cancelWorkOrder,
+  startWorkOrderScheduler, bindWorkOrderNotify
+} from './workorders.js'
+import { generateForWorkOrder } from './notify.js'
 
 const app = express()
 app.use(express.json({ limit: '5mb' })) // 大批量导入（上限 5000 条）
@@ -36,11 +44,19 @@ startScheduler()
 const resumedCollect = resumeCollectTasks()
 if (resumedCollect) console.log(`[COLLECT] ${resumedCollect} 个采集任务随启动自动接续（游标续采）`)
 startCollectScheduler()
+// 协同工单：注入通知联动钩子（拆分分派/超时升级 → 通知任务），并启动 SLA 两级升级调度
+bindWorkOrderNotify({
+  createWorkOrderTasks: (id, opts) => generateForWorkOrder(id, 'created', opts),
+  escalateWorkOrderTasks: (id, level) => generateForWorkOrder(id, level)
+})
+startWorkOrderScheduler()
 
-// 危机列表（含来源规则、承接规则、未解除预警数、时间线）
+// 危机列表（含来源规则、承接规则、未解除预警数、协同工单统计、时间线）
 function crisisList(withTimeline = false) {
   const list = q(`SELECT c.*, a.title alert_title,
-    (SELECT COUNT(*) FROM alert_events ae WHERE ae.crisis_id=c.id AND ae.status='open') open_events
+    (SELECT COUNT(*) FROM alert_events ae WHERE ae.crisis_id=c.id AND ae.status='open') open_events,
+    (SELECT COUNT(*) FROM work_orders wo WHERE wo.crisis_id=c.id AND wo.status IN ('todo','doing','blocked')) wo_open,
+    (SELECT COUNT(*) FROM work_orders wo WHERE wo.crisis_id=c.id) wo_total
     FROM crisis c LEFT JOIN alerts a ON a.id=c.alert_id ORDER BY c.id DESC`)
   return list.map((c) => {
     const rules = q(`SELECT ca.alert_id, ca.is_origin, ca.first_at, ca.last_at, al.title alert_title, al.level alert_level
@@ -59,14 +75,16 @@ app.get('/api/state', (req, res) => {
   const activeAlerts = q('SELECT * FROM alerts WHERE active=1')
   const crises = crisisList()
   const sources = q('SELECT s.*, COUNT(p.id) cnt FROM sources s LEFT JOIN posts p ON p.source_id=s.id GROUP BY s.id')
-  // 闭环统计：未解除预警 / 在办危机（与预警中心、危机处置同口径，SQL 直查不受列表分页限制）
+  // 闭环统计：未解除预警 / 在办危机 / 在办与超时工单（与预警中心、危机处置、工单看板同口径，SQL 直查不受列表分页限制）
   const loop = q1(`SELECT
     (SELECT COUNT(*) FROM alert_events WHERE status='open') alertOpen,
     (SELECT COUNT(*) FROM alert_events) alertTotal,
     (SELECT COUNT(*) FROM crisis WHERE status!='closed') crisisActive,
     (SELECT COUNT(*) FROM crisis WHERE status='closed') crisisClosed,
     (SELECT COUNT(*) FROM notify_tasks WHERE status IN ('pending','failed')) notifyOpen,
-    (SELECT COUNT(*) FROM collect_sources WHERE running=1 AND enabled=1) collectRunning`)
+    (SELECT COUNT(*) FROM collect_sources WHERE running=1 AND enabled=1) collectRunning,
+    (SELECT COUNT(*) FROM work_orders WHERE status IN ('todo','doing','blocked')) workOpen,
+    (SELECT COUNT(*) FROM work_orders WHERE status IN ('todo','doing') AND due_at IS NOT NULL AND due_at<?) workOverdue`, Date.now())
   // 热度趋势（近7时段）
   const nowH = new Date().getHours()
   const trend = []
@@ -389,10 +407,13 @@ app.get('/api/crisis/:id/review', (req, res) => {
 })
 
 // 结案：事务化写入结案档案 + 级联解除关联的未解除预警，完成闭环（重复结案幂等）
+// 守卫：存在未完结协同工单时禁止结案（跨角色协同未闭环），需先完成/取消工单
 app.post('/api/crisis/:id/close', (req, res) => {
   const c = q1('SELECT * FROM crisis WHERE id=?', req.params.id)
   if (!c) return res.status(404).json({ error: 'not found' })
   if (c.status === 'closed') return res.json({ ok: true, already: true })
+  const openWo = crisisOpenCount(c.id)
+  if (openWo > 0) return res.status(400).json({ error: `存在 ${openWo} 个未完结协同工单，请先完成或取消工单后再结案` })
   const summary = (req.body.summary || '').trim() || '预警解除，舆情回落，完成处置闭环。'
   const ts = now()
   const opens = q("SELECT * FROM alert_events WHERE crisis_id=? AND status='open'", c.id)
@@ -462,12 +483,15 @@ app.delete('/api/crisis/:id', (req, res) => {
   run('UPDATE alert_events SET crisis_id=NULL WHERE crisis_id=?', req.params.id)
   run('DELETE FROM crisis_timeline WHERE crisis_id=?', req.params.id)
   run('DELETE FROM crisis_closures WHERE crisis_id=?', req.params.id)
+  // 协同工单随事件删除（工单日志一并清理）
+  const woIds = q('SELECT id FROM work_orders WHERE crisis_id=?', req.params.id).map((r) => r.id)
+  for (const wid of woIds) run('DELETE FROM work_order_logs WHERE wo_id=?', wid)
+  run('DELETE FROM work_orders WHERE crisis_id=?', req.params.id)
   run('DELETE FROM crisis WHERE id=?', req.params.id)
   res.json({ ok: true })
 })
 
-// ===== 通知中心：多渠道订阅与通知编排 =====
-// 权限：viewer 只读 / ops 任务操作（暂停·恢复·重试·回执·取消） / admin 渠道与订阅配置
+// ===== 权限守卫（演示）：viewer 只读 / ops 任务操作 / admin 配置 =====
 const NEED_TEXT = { admin: '管理员', ops: '值班员' }
 function guard(need) {
   return (req, res, next) => {
@@ -477,6 +501,60 @@ function guard(need) {
     next()
   }
 }
+
+// ===== 跨角色危机协同工单 =====
+// 权限：viewer 只读 / ops 值班员（拆分·指派·认领·流转·阻塞·完成·回退·取消） / admin 同 ops 且可配置
+// 工单看板（含状态/处理人/危机过滤、看板汇总、常量字典）
+app.get('/api/work-orders', (req, res) => {
+  const items = listWorkOrders({
+    status: String(req.query.status || ''),
+    crisisId: req.query.crisis_id ? +req.query.crisis_id : null,
+    assignee: String(req.query.assignee || ''),
+    limit: Math.min(300, +req.query.limit || 200)
+  })
+  res.json({
+    items,
+    summary: workOrderSummary(),
+    dict: { status: WO_STATUS, priority: WO_PRIORITY, role: WO_ROLE, category: WO_CATEGORY },
+    actor: actorOf(req)
+  })
+})
+// 工单详情（含操作日志）
+app.get('/api/work-orders/:id', (req, res) => {
+  const w = getWorkOrder(+req.params.id)
+  if (!w) return res.status(404).json({ error: '工单不存在' })
+  res.json({ workOrder: w, logs: workOrderLogs(w.id) })
+})
+// 从危机拆分工单（ops+）
+app.post('/api/work-orders', guard('ops'), (req, res) => {
+  const r = createWorkOrder(req.body, req.actor)
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+// 工单操作统一入口（ops+；服务端状态机守卫，越权/越态返回 400/403）
+function woAction(handler) {
+  return (req, res) => {
+    const r = handler(+req.params.id, req.body || {}, req.actor, req.actor.role)
+    if (!r) return res.status(404).json({ error: '工单不存在' })
+    if (r.error) return res.status(400).json({ error: r.error })
+    res.json(r)
+  }
+}
+app.post('/api/work-orders/:id/assign', guard('ops'), woAction(assignWorkOrder))
+app.post('/api/work-orders/:id/claim', guard('ops'), (req, res) => {
+  const r = claimWorkOrder(+req.params.id, req.actor, req.actor.role)
+  if (!r) return res.status(404).json({ error: '工单不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+app.post('/api/work-orders/:id/start', guard('ops'), woAction(startWorkOrder))
+app.post('/api/work-orders/:id/block', guard('ops'), woAction(blockWorkOrder))
+app.post('/api/work-orders/:id/complete', guard('ops'), woAction(completeWorkOrder))
+app.post('/api/work-orders/:id/rework', guard('ops'), woAction(reworkWorkOrder))
+app.post('/api/work-orders/:id/cancel', guard('ops'), woAction(cancelWorkOrder))
+
+// ===== 通知中心：多渠道订阅与通知编排 =====
+// 权限：viewer 只读 / ops 任务操作（暂停·恢复·重试·回执·取消） / admin 渠道与订阅配置
 
 // 总览：渠道 + 订阅 + 任务计数 + 当前身份（前端据此渲染权限化界面）
 app.get('/api/notify/overview', (req, res) => {
@@ -526,13 +604,13 @@ app.post('/api/notify/subs', guard('admin'), (req, res) => {
   const err = validateSub(req.body)
   if (err) return res.status(400).json({ error: err })
   const b = req.body
-  run(`INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,active,created,created_by)
-    VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)`,
+  run(`INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,wo_event,active,created,created_by)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
     b.name.trim(), b.alert_id ? +b.alert_id : null, (b.topic || '').trim(), String(b.crisis_status || ''),
     (Array.isArray(b.levels) ? b.levels : []).filter((x) => ['red', 'orange', 'yellow'].includes(x)).join(','),
     JSON.stringify(b.channel_ids.map(Number)), b.require_ack ? 1 : 0,
     Math.max(1, +b.ack_timeout_min || 30), b.escalate_channel_id ? +b.escalate_channel_id : null,
-    Math.min(5, Math.max(1, +b.max_retry || 3)), now(), req.actor.user)
+    Math.min(5, Math.max(1, +b.max_retry || 3)), String(b.wo_event || ''), now(), req.actor.user)
   res.json({ ok: true })
 })
 app.put('/api/notify/subs/:id', guard('admin'), (req, res) => {
@@ -541,12 +619,12 @@ app.put('/api/notify/subs/:id', guard('admin'), (req, res) => {
   const err = validateSub(req.body)
   if (err) return res.status(400).json({ error: err })
   const b = req.body
-  run(`UPDATE notify_subs SET name=?,alert_id=?,topic=?,crisis_status=?,levels=?,channel_ids=?,require_ack=?,ack_timeout_min=?,escalate_channel_id=?,max_retry=? WHERE id=?`,
+  run(`UPDATE notify_subs SET name=?,alert_id=?,topic=?,crisis_status=?,levels=?,channel_ids=?,require_ack=?,ack_timeout_min=?,escalate_channel_id=?,max_retry=?,wo_event=? WHERE id=?`,
     b.name.trim(), b.alert_id ? +b.alert_id : null, (b.topic || '').trim(), String(b.crisis_status || ''),
     (Array.isArray(b.levels) ? b.levels : []).filter((x) => ['red', 'orange', 'yellow'].includes(x)).join(','),
     JSON.stringify(b.channel_ids.map(Number)), b.require_ack ? 1 : 0,
     Math.max(1, +b.ack_timeout_min || 30), b.escalate_channel_id ? +b.escalate_channel_id : null,
-    Math.min(5, Math.max(1, +b.max_retry || 3)), s.id)
+    Math.min(5, Math.max(1, +b.max_retry || 3)), String(b.wo_event || ''), s.id)
   res.json({ ok: true })
 })
 app.post('/api/notify/subs/:id/toggle', guard('admin'), (req, res) => {

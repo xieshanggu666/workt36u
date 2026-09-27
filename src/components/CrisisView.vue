@@ -2,7 +2,7 @@
   <div class="crisis">
     <div class="toolbar">
       <button class="add" @click="showForm=!showForm">＋ 新建危机事件</button>
-      <span class="loop-hint">🔗 红/橙预警按「话题 + 时间窗口」归并：多规则并发触发可承接同一事件并上调级别；解除幂等、结案可回滚，全程统一时间线</span>
+      <span class="loop-hint">🔗 红/橙预警按「话题 + 时间窗口」归并：多规则并发触发可承接同一事件并上调级别；解除幂等、结案可回滚；可拆分跨角色协同工单，结案须先完结全部工单</span>
     </div>
 
     <form v-if="showForm" class="c-form" @submit.prevent="create">
@@ -29,6 +29,7 @@
           <b class="ct">{{ c.title }}</b>
           <span class="origin" :class="c.origin">{{ c.origin==='auto' ? '🤖 自动建档' : '✍️ 人工建档' }}</span>
           <span v-if="c.open_events" class="open-badge">🔔 未解除预警 {{ c.open_events }}</span>
+          <span v-if="c.wo_total" class="wo-badge" :class="{open:c.wo_open}">📋 工单 {{ c.wo_open ? c.wo_open+' 在办 / ' : '' }}{{ c.wo_total }}</span>
           <span class="st" :class="c.status">{{ stText(c.status) }}</span>
           <button class="del" @click="del(c)">✕</button>
         </div>
@@ -122,6 +123,7 @@
         <div class="actions">
           <button class="ghost" @click="addStep(c)">＋ 记录处置</button>
           <button v-if="c.status==='monitoring'||c.status==='disposal'" class="prog" @click="advance(c)">推进处置</button>
+          <button v-if="c.status!=='closed'" class="wo-btn" @click="splitWorkOrder(c)">📋 拆分工单</button>
           <button class="ghost" @click="toggleReview(c)">{{ reviewId===c.id ? '收起回溯' : '🔍 回溯' }}</button>
           <button v-if="c.status!=='closed'" class="close" @click="toggleReview(c, true)">结案</button>
           <button v-else class="reopen" @click="reopen(c)">↩︎ 回滚结案</button>
@@ -167,9 +169,16 @@ function defaultSummary(c) {
 }
 async function confirmClose(c) {
   if (!confirm(`确定结案「${c.title}」？`)) return
-  await store.closeCrisis(c.id, closeSummary.value)
-  reviewId.value = null
-  review.value = null
+  try {
+    await store.closeCrisis(c.id, closeSummary.value)
+    reviewId.value = null
+    review.value = null
+  } catch (e) { store.msg(e.message, 'warn') } // 结案守卫：未完结工单拦截
+}
+// 跳转协同工单页并预填所属危机（页签状态在 store）
+function splitWorkOrder(c) {
+  store.woDraftCrisis = c.id
+  store.tab = 'work'
 }
 async function reopen(c) {
   const note = prompt(`回滚结案「${c.title}」：结案时联动解除的预警将恢复为未解除，事件重回处置流程。\n回滚说明（可留空）：`)
@@ -177,7 +186,7 @@ async function reopen(c) {
   await store.reopenCrisis(c.id, note)
   if (reviewId.value === c.id) review.value = await store.fetchCrisisReview(c.id) // 刷新回溯（结案档案/未解除计数）
 }
-function kindText(k) { return { manual: '手动解除', batch: '批量解除', close: '结案联动', notify: '通知回执' }[k] || k }
+function kindText(k) { return { manual: '手动解除', batch: '批量解除', close: '结案联动', notify: '通知回执', workorder: '工单联动' }[k] || k }
 async function del(c) {
   if (confirm(`删除危机「${c.title}」？`)) await store.delCrisis(c.id)
 }
@@ -207,6 +216,8 @@ textarea{resize:vertical;min-height:52px;}
 .origin{font-size:10px;padding:2px 8px;border-radius:6px;background:#0d2137;color:#90caf9;border:1px solid rgba(144,202,249,.25);}
 .origin.manual{background:#1a2332;color:#8ba2c8;border-color:rgba(120,160,220,.2);}
 .open-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#3e2723;color:#ffab91;border:1px solid rgba(255,138,101,.3);}
+.wo-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#0d2137;color:#90caf9;border:1px solid rgba(144,202,249,.25);}
+.wo-badge.open{background:#132a52;color:#bbdefb;border-color:rgba(66,165,245,.4);}
 .st{font-size:11px;padding:2px 10px;border-radius:6px;}
 .st.monitoring{background:#37474f;color:#b0bec5;}.st.disposal{background:#b71c1c;color:#ffcdd2;}.st.closed{background:#1b5e20;color:#a5d6a7;}
 .del{background:none;border:none;color:#ef5350;font-size:15px;cursor:pointer;}
@@ -270,6 +281,7 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .closed-tip{color:#81c784;font-size:11px;text-align:center;padding:6px 0 2px;}
 .actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;}
 .prog{background:linear-gradient(135deg,#ef6c00,#e65100);border:none;color:#fff;font-weight:600;cursor:pointer;}
+.wo-btn{background:linear-gradient(135deg,#00897b,#00695c);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .close{background:linear-gradient(135deg,#2e7d32,#1b5e20);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .reopen{background:linear-gradient(135deg,#f9a825,#f57f17);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .none{color:#5b6f94;text-align:center;padding:40px;}

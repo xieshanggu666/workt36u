@@ -246,6 +246,45 @@ CREATE TABLE IF NOT EXISTS collect_runs (
   finished TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_collect_runs_source ON collect_runs (source_id, id);
+-- 跨角色协同工单：从危机拆分，支持指派/认领、状态流转、阻塞挂起、超时升级、回退与结果回写
+CREATE TABLE IF NOT EXISTS work_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  crisis_id INTEGER NOT NULL,          -- 所属危机事件
+  title TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT 'other', -- pr/legal/ops/support/other（公关/法务/运营/客服/其他）
+  priority TEXT NOT NULL DEFAULT 'normal', -- urgent/high/normal
+  status TEXT NOT NULL DEFAULT 'todo',    -- todo/doing/blocked/done/cancelled
+  assignee TEXT NOT NULL DEFAULT '',      -- 处理人（空=待分派）
+  assignee_role TEXT NOT NULL DEFAULT '', -- 处理人角色（跨角色协同：pr/legal/ops/support/admin）
+  created_by TEXT NOT NULL DEFAULT '',
+  due_at INTEGER,                         -- SLA 截止毫秒时间戳（NULL=无时限）
+  escalated INTEGER NOT NULL DEFAULT 0,   -- 超时升级级别：0 未升级 / 1 超时提醒 / 2 升级督办
+  last_remind_at INTEGER,                 -- 最近一次升级动作时间（两级升级间隔防抖）
+  blocked_reason TEXT NOT NULL DEFAULT '',
+  result TEXT NOT NULL DEFAULT '',        -- 处理结果（完成时回写危机时间线）
+  resolve_alerts INTEGER NOT NULL DEFAULT 0, -- 完成时是否联动解除该危机下未解除预警
+  sla_budget_ms INTEGER,                  -- SLA 总时长（毫秒），阻塞恢复后据此重算截止
+  paused_at INTEGER,                      -- 阻塞挂起时刻（毫秒），NULL=计时中
+  started_at TEXT,
+  done_at TEXT,
+  cancelled_at TEXT,
+  created TEXT NOT NULL,
+  updated TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_work_orders_crisis ON work_orders (crisis_id, status);
+CREATE INDEX IF NOT EXISTS idx_work_orders_due ON work_orders (status, escalated, due_at);
+-- 工单全程留痕：拆分/分派/认领/流转/阻塞/恢复/超时升级/回退/完成/取消（含操作人，支持跨角色审计）
+CREATE TABLE IF NOT EXISTS work_order_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  wo_id INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  operator TEXT NOT NULL DEFAULT '系统',
+  operator_role TEXT NOT NULL DEFAULT '',
+  time TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_work_order_logs_wo ON work_order_logs (wo_id, id);
 -- 注：posts.idem_key 索引在下方 ensureColumn 之后创建（旧库可能尚无该列，此处创建会导致启动失败）
 `)
 
@@ -276,6 +315,13 @@ ensureColumn('crisis', 'topic', "topic TEXT NOT NULL DEFAULT ''")
 ensureColumn('crisis', 'last_trigger_at', 'last_trigger_at INTEGER')
 ensureColumn('posts', 'idem_key', 'idem_key TEXT')
 db.exec('CREATE INDEX IF NOT EXISTS idx_posts_idem_key ON posts (idem_key) WHERE idem_key IS NOT NULL;')
+// 通知任务来源扩展：工单事件（工单生成/超时升级）复用通知调度，wo_event 标识具体事件用于幂等
+ensureColumn('notify_tasks', 'work_order_id', 'work_order_id INTEGER')
+ensureColumn('notify_tasks', 'wo_event', "wo_event TEXT NOT NULL DEFAULT ''")
+ensureColumn('notify_subs', 'wo_event', "wo_event TEXT NOT NULL DEFAULT ''")
+// 老库迁移：工单 SLA 挂起计时字段
+ensureColumn('work_orders', 'sla_budget_ms', 'sla_budget_ms INTEGER')
+ensureColumn('work_orders', 'paused_at', 'paused_at INTEGER')
 
 // 迁移：早期版本 import_job_items.idem_key 为全局唯一，跨任务内容去重时同名键会冲突，
 // 重建表去掉该唯一约束（保留 (job_id, seq) 唯一与普通索引）。
@@ -480,6 +526,13 @@ function seedNotify() {
   ns.run('食安话题跟踪推送', null, '食品安全', '', '', JSON.stringify([ch2, ch3]), 0, 30, null, 3, nowStr, '系统初始化')
   // 危机结案 → Webhook 通报
   ns.run('危机结案通报', null, '', 'closed', '', JSON.stringify([ch1]), 0, 30, null, 3, nowStr, '系统初始化')
+  // 工单超时升级（两级）→ 升级专线，需回执（超时升级闭环演示）
+  ns.run('工单超时升级督办', null, '', '', '', JSON.stringify([ch4]), 1, 1, ch4, 3, nowStr, '系统初始化')
+  // 新工单分派 → 值班 Webhook（跨角色协同通知）
+  ns.run('协同工单分派通知', null, '', '', '', JSON.stringify([ch1]), 0, 30, null, 3, nowStr, '系统初始化')
+  // 标记工单事件订阅（wo_event：created=新工单分派/认领提醒，escalated=超时升级；普通预警订阅为空）
+  db.prepare("UPDATE notify_subs SET wo_event='escalated' WHERE name='工单超时升级督办' AND wo_event=''").run()
+  db.prepare("UPDATE notify_subs SET wo_event='created' WHERE name='协同工单分派通知' AND wo_event=''").run()
 }
 seedNotify()
 
@@ -497,3 +550,48 @@ function seedCollect() {
   cs.run('论坛爬虫（故障演练）', 'crawler', 'mock://forum/always-fail', 6, '', '', 30, 5, 3, nowStr, '系统初始化')
 }
 seedCollect()
+
+// 协同工单种子（独立幂等：老库升级后同样补齐演示工单；关联既有危机事件）
+function seedWorkOrders() {
+  const n = db.prepare('SELECT COUNT(*) c FROM work_orders').get().c
+  if (n > 0) return
+  const now = new Date()
+  const c1 = db.prepare("SELECT id FROM crisis WHERE title LIKE '%门店卫生%' ORDER BY id LIMIT 1").get()
+  const c2 = db.prepare("SELECT id FROM crisis WHERE title LIKE '%投诉类话题%' ORDER BY id LIMIT 1").get()
+  if (!c1 || !c2) return // 老库缺少演示危机事件时跳过（不影响工单功能本身）
+  const ago = (m) => new Date(now.getTime() - m * 60000).toLocaleString('zh-CN')
+  const wo = db.prepare(`INSERT INTO work_orders
+    (crisis_id,title,detail,category,priority,status,assignee,assignee_role,created_by,due_at,escalated,started_at,created,updated)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+  const wl = db.prepare('INSERT INTO work_order_logs (wo_id,action,detail,operator,operator_role,time) VALUES (?,?,?,?,?,?)')
+  // 公关口径单（处理中，SLA 1 分钟，便于观察超时升级两级流转）
+  const w1 = Number(wo.run(c1.id, '统一对外回应口径', '梳理事件时间线，2 小时内发布首份官方声明并同步媒体口径。',
+    'pr', 'urgent', 'doing', '李澈', 'ops', '张岚', now.getTime() + 60000, 0, ago(60), ago(70), ago(20)).lastInsertRowid)
+  wl.run(w1, 'created', '从危机事件拆分协同工单（紧急 · 公关口径）', '张岚', 'admin', ago(70))
+  wl.run(w1, 'assigned', '指派给 李澈（值班员），SLA 1 分钟', '张岚', 'admin', ago(70))
+  wl.run(w1, 'started', '领取并开始处理', '李澈', 'ops', ago(60))
+  // 法务取证单（已阻塞，等待第三方材料，SLA 挂起）
+  const w2 = Number(wo.run(c1.id, '固定证据与合规评估', '固定暗访视频原始来源，评估涉事门店合规责任，待第三方检测机构出具材料。',
+    'legal', 'high', 'blocked', '陈律', 'legal', '张岚', null, 0, ago(50), ago(100), ago(15)).lastInsertRowid)
+  db.prepare('UPDATE work_orders SET blocked_reason=? WHERE id=?').run('等待第三方检测机构材料（预计 1 个工作日）', w2)
+  wl.run(w2, 'created', '从危机事件拆分协同工单（高优 · 法务取证）', '张岚', 'admin', ago(100))
+  wl.run(w2, 'assigned', '指派给 陈律（法务）', '张岚', 'admin', ago(100))
+  wl.run(w2, 'started', '领取并开始处理', '陈律', 'legal', ago(50))
+  wl.run(w2, 'blocked', '阻塞：等待第三方检测机构材料（预计 1 个工作日），SLA 挂起', '陈律', 'legal', ago(15))
+  // 客诉跟进单（待分派，SLA 30 分钟）
+  const w3 = Number(wo.run(c2.id, '集中客诉工单回访', '对近 24 小时投诉类客诉逐一回访，退款进度同步客服台账。',
+    'support', 'high', 'todo', '', '', '张岚', now.getTime() + 30 * 60000, 0, null, ago(25), ago(25)).lastInsertRowid)
+  wl.run(w3, 'created', '从危机事件拆分协同工单（高优 · 客服回访），待分派', '张岚', 'admin', ago(25))
+  // 已完成单（演示结果回写时间线的历史工单）
+  const w4 = Number(wo.run(c1.id, '关停涉事门店现场核查', '涉事门店暂停营业，完成现场卫生核查并拍照留档。',
+    'ops', 'urgent', 'done', '李澈', 'ops', '张岚', null, 0, ago(120), ago(125), ago(118)).lastInsertRowid)
+  db.prepare('UPDATE work_orders SET done_at=?,result=? WHERE id=?')
+    .run(ago(118), '涉事门店已关停，现场核查完成，整改清单已下发并要求 24 小时内反馈。', w4)
+  wl.run(w4, 'created', '从危机事件拆分协同工单（紧急 · 现场核查）', '张岚', 'admin', ago(125))
+  wl.run(w4, 'assigned', '指派给 李澈（值班员）', '张岚', 'admin', ago(125))
+  wl.run(w4, 'started', '领取并开始处理', '李澈', 'ops', ago(120))
+  wl.run(w4, 'done', '完成：涉事门店已关停，现场核查完成，整改清单已下发并要求 24 小时内反馈。', '李澈', 'ops', ago(118))
+  if (c1) db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)')
+    .run(c1.id, '工单完成', `协同工单「关停涉事门店现场核查」已由 李澈 完成：涉事门店已关停，现场核查完成，整改清单已下发并要求 24 小时内反馈。`, ago(118))
+}
+seedWorkOrders()
